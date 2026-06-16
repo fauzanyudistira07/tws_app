@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -50,6 +49,9 @@ class BluetoothController extends ChangeNotifier {
   bool _permissionsReady = false;
   bool _bluetoothSupported = true;
   bool _isScanning = false;
+  bool _restartRequired = false;
+  bool _overlayPermissionGranted = false;
+  bool _bluetoothPermissionGranted = false;
   BluetoothAdapterState _adapterState = BluetoothAdapterState.unknown;
   String? _statusMessage;
   BluetoothEvent? _latestEvent;
@@ -61,12 +63,14 @@ class BluetoothController extends ChangeNotifier {
   bool get permissionsReady => _permissionsReady;
   bool get bluetoothSupported => _bluetoothSupported;
   bool get isScanning => _isScanning;
+  bool get restartRequired => _restartRequired;
   BluetoothAdapterState get adapterState => _adapterState;
   String? get statusMessage => _statusMessage;
   BluetoothEvent? get latestEvent => _latestEvent;
 
   Future<void> initialize() async {
     try {
+      await _captureInitialPermissionSnapshot();
       _bluetoothSupported = await FlutterBluePlus.isSupported;
       _adapterSubscription ??= FlutterBluePlus.adapterState.listen((state) {
         _adapterState = state;
@@ -89,6 +93,11 @@ class BluetoothController extends ChangeNotifier {
       );
 
       await _ensurePermissions();
+      await _ensureBackgroundService();
+      _serviceRunning = await MethodChannelService.isServiceRunning();
+
+      final storedHistory = await MethodChannelService.getEventHistory();
+      _restoreHistory(storedHistory);
 
       _nativeEventSubscription ??=
           MethodChannelService.connectionEvents().listen(_handleRawEvent);
@@ -107,12 +116,51 @@ class BluetoothController extends ChangeNotifier {
     await _ensurePermissions();
     await MethodChannelService.startBackgroundService();
     _serviceRunning = true;
+    _statusMessage = 'Background popup service is running.';
     notifyListeners();
   }
 
   Future<void> stopService() async {
     await MethodChannelService.stopBackgroundService();
     _serviceRunning = false;
+    _statusMessage = 'Background popup service stopped.';
+    notifyListeners();
+  }
+
+  Future<void> showPreviewPopup() async {
+    try {
+      await _ensurePermissions();
+      await MethodChannelService.showPreviewPopup();
+      _statusMessage = 'Showing preview popup...';
+      notifyListeners();
+    } catch (error) {
+      _statusMessage = 'Preview popup failed: $error';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _ensureBackgroundService() async {
+    if (!_permissionsReady) {
+      return;
+    }
+
+    try {
+      if (!await MethodChannelService.isServiceRunning()) {
+        await MethodChannelService.startBackgroundService();
+      }
+      _serviceRunning = await MethodChannelService.isServiceRunning();
+      _statusMessage = 'Background popup service is running.';
+      notifyListeners();
+    } catch (error) {
+      _serviceRunning = false;
+      _statusMessage = 'Unable to start background service: $error';
+      notifyListeners();
+    }
+  }
+
+  Future<void> refreshAfterResume() async {
+    await _ensurePermissions();
+    _serviceRunning = await MethodChannelService.isServiceRunning();
     notifyListeners();
   }
 
@@ -195,21 +243,55 @@ class BluetoothController extends ChangeNotifier {
   }
 
   Future<void> _ensurePermissions() async {
+    final wasBluetoothGranted = _bluetoothPermissionGranted;
+    final wasOverlayGranted = _overlayPermissionGranted;
+
     final permissions = <Permission>[
-      Permission.bluetoothScan,
       Permission.bluetoothConnect,
-      Permission.notification,
       if (defaultTargetPlatform == TargetPlatform.android)
-        Permission.locationWhenInUse,
+        Permission.notification,
     ];
     final statuses = await permissions.request();
 
-    final overlayAllowed = await FlutterOverlayWindow.isPermissionGranted() ||
-        (await FlutterOverlayWindow.requestPermission() ?? false);
+    var overlayAllowed = await MethodChannelService.hasOverlayPermission();
+    if (!overlayAllowed) {
+      overlayAllowed = await FlutterOverlayWindow.isPermissionGranted() ||
+          (await FlutterOverlayWindow.requestPermission() ?? false);
+      if (!overlayAllowed) {
+        overlayAllowed = await MethodChannelService.hasOverlayPermission();
+      }
+    }
 
-    _permissionsReady =
-        statuses.values.every((status) => status.isGranted) && overlayAllowed;
+    final bluetoothReady =
+        statuses[Permission.bluetoothConnect]?.isGranted ?? false;
+    final notificationReady = defaultTargetPlatform != TargetPlatform.android ||
+        (statuses[Permission.notification]?.isGranted ?? true);
+
+    _bluetoothPermissionGranted = bluetoothReady;
+    _overlayPermissionGranted = overlayAllowed;
+    _permissionsReady = bluetoothReady;
+    if ((bluetoothReady && !wasBluetoothGranted) ||
+        (overlayAllowed && !wasOverlayGranted)) {
+      _restartRequired = true;
+    }
+    if (_permissionsReady) {
+      await _ensureBackgroundService();
+      _serviceRunning = await MethodChannelService.isServiceRunning();
+      if (!notificationReady) {
+        _statusMessage = 'Popup monitor aktif, tapi notifikasi Android belum diizinkan.';
+      } else if (!overlayAllowed) {
+        _statusMessage = 'Bluetooth monitor aktif, tapi izin tampil di atas aplikasi belum aktif.';
+      }
+    } else {
+      _serviceRunning = false;
+    }
     notifyListeners();
+  }
+
+  Future<void> _captureInitialPermissionSnapshot() async {
+    _bluetoothPermissionGranted =
+        (await Permission.bluetoothConnect.status).isGranted;
+    _overlayPermissionGranted = await MethodChannelService.hasOverlayPermission();
   }
 
   void _handleScanResults(List<ScanResult> results) {
@@ -262,32 +344,39 @@ class BluetoothController extends ChangeNotifier {
 
   Future<void> _handleRawEvent(Map<String, dynamic> data) async {
     final event = BluetoothEvent.fromMap(data);
+    _insertEvent(event);
+
+    notifyListeners();
+  }
+
+  void _restoreHistory(List<Map<String, dynamic>> events) {
+    _history
+      ..clear()
+      ..addAll(events.map(BluetoothEvent.fromMap));
+
+    if (_history.isNotEmpty) {
+      _latestEvent = _history.first;
+    }
+    notifyListeners();
+  }
+
+  void _insertEvent(BluetoothEvent event) {
+    final duplicated = _history.any(
+      (existing) =>
+          existing.deviceName == event.deviceName &&
+          existing.status == event.status &&
+          existing.timestamp == event.timestamp,
+    );
+    if (duplicated) {
+      _latestEvent = event;
+      return;
+    }
+
     _latestEvent = event;
     _history.insert(0, event);
     if (_history.length > 20) {
       _history.removeLast();
     }
-
-    if (event.status == 'connected' && _permissionsReady) {
-      await FlutterOverlayWindow.showOverlay(
-        enableDrag: false,
-        alignment: OverlayAlignment.center,
-        height: 340,
-        width: 360,
-        overlayTitle: 'KiiP DTS16',
-        overlayContent: 'Device connected',
-        flag: OverlayFlag.defaultFlag,
-      );
-      await FlutterOverlayWindow.shareData(
-        jsonEncode(<String, dynamic>{
-          'deviceName': event.deviceName,
-          'batteryLevel': event.batteryLevel ?? -1,
-          'status': event.status,
-        }),
-      );
-    }
-
-    notifyListeners();
   }
 
   DiscoveredTwsDevice? _findExisting(String remoteId) {

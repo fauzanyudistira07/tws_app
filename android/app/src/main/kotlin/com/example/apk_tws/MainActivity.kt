@@ -1,10 +1,15 @@
 package com.example.apk_tws
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
+import android.util.Log
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -29,12 +34,7 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
-                    val serviceIntent = Intent(this, TwsBackgroundService::class.java)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(serviceIntent)
-                    } else {
-                        startService(serviceIntent)
-                    }
+                    ensureServiceRunning()
                     result.success(null)
                 }
 
@@ -43,7 +43,28 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
 
-                "getInitialEvent" -> result.success(pendingEvent)
+                "isServiceRunning" -> result.success(TwsBackgroundService.isRunning)
+                "hasOverlayPermission" -> {
+                    result.success(
+                        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                    )
+                }
+                "getInitialEvent" -> result.success(
+                    pendingEvent ?: TwsBackgroundService.readLatestEvent(this)
+                )
+                "getEventHistory" -> result.success(TwsBackgroundService.readStoredEvents(this))
+                "showPreviewPopup" -> {
+                    ensureServiceRunning()
+                    val intent = Intent(this, TwsBackgroundService::class.java).apply {
+                        action = TwsBackgroundService.ACTION_SHOW_PREVIEW
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -67,8 +88,13 @@ class MainActivity : FlutterActivity() {
 
     override fun onStart() {
         super.onStart()
+        ensureServiceRunning()
         if (!receiverRegistered) {
-            registerReceiver(receiver, IntentFilter(EVENT_ACTION))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, IntentFilter(EVENT_ACTION), RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, IntentFilter(EVENT_ACTION))
+            }
             receiverRegistered = true
         }
         intent?.let(::publishEvent)
@@ -90,6 +116,7 @@ class MainActivity : FlutterActivity() {
 
     private fun publishEvent(intent: Intent) {
         val deviceName = intent.getStringExtra("deviceName") ?: return
+        Log.d(TAG, "Delivering event to Flutter: $deviceName ${intent.getStringExtra("status")}")
         pendingEvent = hashMapOf(
             "deviceName" to deviceName,
             "status" to (intent.getStringExtra("status") ?: "unknown"),
@@ -101,10 +128,30 @@ class MainActivity : FlutterActivity() {
         events?.success(pendingEvent)
     }
 
+    private fun ensureServiceRunning() {
+        val hasBluetoothConnectPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.BLUETOOTH_CONNECT
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasBluetoothConnectPermission) {
+            Log.d(TAG, "Skipping service start because BLUETOOTH_CONNECT is not granted")
+            return
+        }
+
+        val serviceIntent = Intent(this, TwsBackgroundService::class.java)
+        Log.d(TAG, "Ensuring background service is running")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+    }
+
     companion object {
         const val EVENT_ACTION = "com.example.apk_tws.CONNECTION_EVENT"
         private const val METHOD_CHANNEL = "apk_tws/service"
         private const val EVENT_CHANNEL = "apk_tws/events"
+        private const val TAG = "KiiPPopup"
         private var pendingEvent: HashMap<String, Any?>? = null
     }
 }
